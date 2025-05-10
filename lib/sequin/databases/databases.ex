@@ -132,27 +132,12 @@ defmodule Sequin.Databases do
              Replication.create_pg_replication(
                account_id,
                replication_params
-             ),
-           {:ok, db} <- maybe_create_primary_db(db, db_params) do
+             ) do
         db_with_associations = Repo.preload(db, [:replication_slot])
         {:ok, %PostgresDatabase{db_with_associations | replication_slot: replication}}
       end
     end)
   end
-
-  defp maybe_create_primary_db(db, %{"primary" => primary_params}) when is_map(primary_params) do
-    primary_params = Map.put(primary_params, "postgres_database_id", db.id)
-
-    %PostgresDatabasePrimary{}
-    |> PostgresDatabasePrimary.changeset(primary_params)
-    |> Repo.insert()
-    |> case do
-      {:ok, _primary} -> {:ok, db}
-      {:error, changeset} -> {:error, Error.validation(changeset: changeset)}
-    end
-  end
-
-  defp maybe_create_primary_db(db, _), do: {:ok, db}
 
   @doc """
   Updates a PostgresDatabase and its associated PostgresReplicationSlot transactionally.
@@ -447,23 +432,31 @@ defmodule Sequin.Databases do
   end
 
   def test_maybe_replica(%PostgresDatabase{} = db, db_primary) do
-    with true <- replica?(db),
-         true <- not is_nil(db_primary),
-         {:ok, version} when version >= 16 <- get_pg_major_version(db),
-         :ok <- test_connect(db_primary) do
-      :ok
-    else
-      {:ok, _not_16_or_higher} ->
-        {:error, Error.validation(summary: "PostgreSQL version 16 or higher is required for replica databases")}
-
-      false when not is_nil(db_primary) ->
+    cond do
+      not replica?(db) ->
         :ok
 
-      false ->
-        {:error, Error.validation(summary: "Primary connection parameters are required for replica databases")}
+      is_nil(db_primary) ->
+        summary = """
+        Primary connection parameters are required for replica databases. Edit the database to add primary connection details.
+        """
 
-      {:error, error} ->
-        {:error, Error.validation(summary: "Failed to connect to primary database: #{inspect(error)}")}
+        {:error, Error.validation(summary: summary)}
+
+      not match?({:ok, version} when version >= 16, get_pg_major_version(db)) ->
+        {:error, Error.validation(summary: "PostgreSQL version 16 or higher is required for replica databases")}
+
+      true ->
+        case test_connect(db_primary) do
+          :ok ->
+            :ok
+
+          {:error, ex} when is_exception(ex) ->
+            {:error, Error.validation(summary: "Failed to connect to primary database: #{Exception.message(ex)}")}
+
+          {:error, error} ->
+            {:error, Error.validation(summary: "Failed to connect to primary database: #{inspect(error)}")}
+        end
     end
   end
 
